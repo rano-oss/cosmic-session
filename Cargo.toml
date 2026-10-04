@@ -10,14 +10,20 @@ publish = false
 
 [dependencies]
 color-eyre = "0.6"
+cosmic-comp-config = { git = "https://github.com/rano-oss/cosmic-comp", branch = "input-method-unstable-v3", default-features = false }
+cosmic-config = { git = "https://github.com/rano-oss/libcosmic", branch = "input-method-unstable-v3" }
 futures-util = "0.3"
 cosmic-dbus-a11y = { git = "https://github.com/pop-os/dbus-settings-bindings" }
+libc = "0.2"
+rand = "0.9"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.31.2", features = ["staging", "client"] }
 freedesktop-desktop-entry = { version = "0.8", optional = true }
 shell-words = { version = "1.1.1", optional = true }
 dirs = { version = "6.0.0", optional = true }
 launch-pad = { git = "https://github.com/pop-os/launch-pad" }
 log-panics = { version = "2", features = ["with-backtrace"] }
-rustix = "1.1"
+rustix = { version = "1.1", features = ["pipe"] }
 scopeguard = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -49,3 +55,7 @@ systemd = ["dep:zbus_systemd", "dep:tracing-journald"]
 logind = ["systemd", "logind-zbus"]
 default = ["logind"]
 autostart = ["dep:shell-words", "dep:dirs", "dep:freedesktop-desktop-entry"]
+
+[patch."https://github.com/pop-os/libcosmic"]
+libcosmic = { git = "https://github.com/rano-oss/libcosmic", branch = "input-method-unstable-v3" }
+cosmic-config = { git = "https://github.com/rano-oss/libcosmic", branch = "input-method-unstable-v3" }

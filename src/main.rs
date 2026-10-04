@@ -4,6 +4,7 @@ extern crate tracing;
 
 mod a11y;
 mod comp;
+mod input_method;
 mod notifications;
 mod process;
 mod service;
@@ -24,9 +25,9 @@ use std::path::PathBuf;
 #[cfg(feature = "autostart")]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use systemd::is_systemd_used;
 #[cfg(feature = "systemd")]
-use systemd::spawn_scope;
-use systemd::{get_systemd_env, is_systemd_used};
+use systemd::{get_systemd_env, spawn_scope};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, oneshot};
@@ -86,6 +87,10 @@ async fn main() -> Result<()> {
 
 	log_panics::init();
 
+	if env::args().nth(1).as_deref() == Some("--ime-supervisor") {
+		return input_method::run_standalone();
+	}
+
 	let (session_tx, mut session_rx) = tokio::sync::mpsc::channel(10);
 	let session_tx_clone = session_tx.clone();
 	let _conn = zbus::connection::Builder::session()?
@@ -143,12 +148,10 @@ async fn start(
 		.await;
 	let token = CancellationToken::new();
 	let (env_tx, env_rx) = oneshot::channel();
-	let systemd_env = get_systemd_env().await;
 	let compositor_handle = comp::run_compositor(
 		&process_manager,
 		executable.clone(),
 		args,
-		systemd_env.clone(),
 		token.child_token(),
 		env_tx,
 		session_tx,
@@ -165,12 +168,9 @@ async fn start(
 		env_vars
 	);
 
-	// now that cosmic-comp is ready, extend the env vars with the systemd_env and set XDG_SESSION_TYPE=wayland for new processes
-	env_vars.extend(
-		systemd_env
-			.into_iter()
-			.chain([("XDG_SESSION_TYPE".to_string(), "wayland".to_string())]),
-	);
+	// now that cosmic-comp is ready, set XDG_SESSION_TYPE=wayland for new
+	// processes
+	env_vars.push(("XDG_SESSION_TYPE".to_string(), "wayland".to_string()));
 	systemd::set_systemd_environment("XDG_SESSION_TYPE", "wayland").await;
 
 	// expose the session version
@@ -182,6 +182,33 @@ async fn start(
 
 	#[cfg(feature = "systemd")]
 	let _inhibit_fd = if *is_systemd_used() {
+		match get_systemd_env().await {
+			Ok(env) => {
+				for systemd_env in env {
+					// Only update the envvar if unset
+					if std::env::var_os(&systemd_env.key).is_none() {
+						// Blacklist of envvars that we shouldn't touch (taken
+						// from KDE)
+						if (!systemd_env.key.starts_with("XDG_")
+							|| systemd_env.key == "XDG_DATA_DIRS"
+							|| systemd_env.key == "XDG_CONFIG_DIRS")
+							&& systemd_env.key != "DISPLAY"
+							&& systemd_env.key != "XAUTHORITY"
+							&& systemd_env.key != "WAYLAND_DISPLAY"
+							&& systemd_env.key != "WAYLAND_SOCKET"
+							&& systemd_env.key != "_"
+							&& systemd_env.key != "SHELL"
+							&& systemd_env.key != "SHLVL"
+						{
+							env_vars.push((systemd_env.key, systemd_env.value));
+						}
+					}
+				}
+			}
+			Err(err) => {
+				warn!("Failed to sync systemd environment {}.", err);
+			}
+		};
 		#[cfg(feature = "logind")]
 		match zbus::Connection::system().await {
 			Ok(connection) => match logind_zbus::manager::ManagerProxy::new(&connection).await {
@@ -263,98 +290,109 @@ async fn start(
 	// start a11y if configured
 	tokio::spawn(a11y::start_a11y(env_vars.clone(), process_manager.clone()));
 
-	let (panel_notifications_fd, daemon_notifications_fd) =
-		notifications::create_socket().expect("Failed to create notification socket");
+	// launch native input methods from cosmic-comp keyboard map (pinyinwl,
+	// chewingwl, …)
+	input_method::start(env_vars.clone(), token.child_token());
 
-	let mut daemon_env_vars = env_vars.clone();
-	daemon_env_vars.push((
-		DAEMON_NOTIFICATIONS_FD.to_string(),
-		daemon_notifications_fd.as_raw_fd().to_string(),
-	));
-	let mut panel_env_vars = env_vars.clone();
-	panel_env_vars.push((
-		PANEL_NOTIFICATIONS_FD.to_string(),
-		panel_notifications_fd.as_raw_fd().to_string(),
-	));
+	let minimal_session = env::var_os("COSMIC_SESSION_MINIMAL").is_some();
+	if minimal_session {
+		info!(
+			"COSMIC_SESSION_MINIMAL=1: skipping panel, launcher, and other session UI components"
+		);
+	} else {
+		let (panel_notifications_fd, daemon_notifications_fd) =
+			notifications::create_socket().expect("Failed to create notification socket");
 
-	let panel_key = Arc::new(Mutex::new(None));
-	let notif_key = Arc::new(Mutex::new(None));
+		let mut daemon_env_vars = env_vars.clone();
+		daemon_env_vars.push((
+			DAEMON_NOTIFICATIONS_FD.to_string(),
+			daemon_notifications_fd.as_raw_fd().to_string(),
+		));
+		let mut panel_env_vars = env_vars.clone();
+		panel_env_vars.push((
+			PANEL_NOTIFICATIONS_FD.to_string(),
+			panel_notifications_fd.as_raw_fd().to_string(),
+		));
 
-	let notifications_span = info_span!(parent: None, "cosmic-notifications");
-	let panel_span = info_span!(parent: None, "cosmic-panel");
+		let panel_key = Arc::new(Mutex::new(None));
+		let notif_key = Arc::new(Mutex::new(None));
 
-	let mut guard = notif_key.lock().await;
-	*guard = Some(
-		process_manager
-			.start(notifications_process(
-				notifications_span.clone(),
-				"cosmic-notifications",
-				notif_key.clone(),
-				daemon_env_vars.clone(),
-				daemon_notifications_fd,
-				panel_span.clone(),
-				"cosmic-panel",
-				panel_key.clone(),
-				panel_env_vars.clone(),
-			))
-			.await
-			.expect("failed to start notifications daemon"),
-	);
-	drop(guard);
+		let notifications_span = info_span!(parent: None, "cosmic-notifications");
+		let panel_span = info_span!(parent: None, "cosmic-panel");
 
-	let mut guard = panel_key.lock().await;
-	*guard = Some(
-		process_manager
-			.start(notifications_process(
-				panel_span,
-				"cosmic-panel",
-				panel_key.clone(),
-				panel_env_vars,
-				panel_notifications_fd,
-				notifications_span,
-				"cosmic-notifications",
-				notif_key,
-				daemon_env_vars,
-			))
-			.await
-			.expect("failed to start panel"),
-	);
-	drop(guard);
+		let mut guard = notif_key.lock().await;
+		*guard = Some(
+			process_manager
+				.start(notifications_process(
+					notifications_span.clone(),
+					"cosmic-notifications",
+					notif_key.clone(),
+					daemon_env_vars.clone(),
+					daemon_notifications_fd,
+					panel_span.clone(),
+					"cosmic-panel",
+					panel_key.clone(),
+					panel_env_vars.clone(),
+				))
+				.await
+				.expect("failed to start notifications daemon"),
+		);
+		drop(guard);
 
-	let span = info_span!(parent: None, "cosmic-app-library");
-	start_component("cosmic-app-library", span, &process_manager, &env_vars).await;
+		let mut guard = panel_key.lock().await;
+		*guard = Some(
+			process_manager
+				.start(notifications_process(
+					panel_span,
+					"cosmic-panel",
+					panel_key.clone(),
+					panel_env_vars,
+					panel_notifications_fd,
+					notifications_span,
+					"cosmic-notifications",
+					notif_key,
+					daemon_env_vars,
+				))
+				.await
+				.expect("failed to start panel"),
+		);
+		drop(guard);
 
-	let span = info_span!(parent: None, "cosmic-launcher");
-	start_component("cosmic-launcher", span, &process_manager, &env_vars).await;
+		let span = info_span!(parent: None, "cosmic-app-library");
+		start_component("cosmic-app-library", span, &process_manager, &env_vars).await;
 
-	let span = info_span!(parent: None, "cosmic-workspaces");
-	start_component("cosmic-workspaces", span, &process_manager, &env_vars).await;
+		let span = info_span!(parent: None, "cosmic-launcher");
+		start_component("cosmic-launcher", span, &process_manager, &env_vars).await;
 
-	let span = info_span!(parent: None, "cosmic-osd");
-	start_component("cosmic-osd", span, &process_manager, &env_vars).await;
+		let span = info_span!(parent: None, "cosmic-workspaces");
+		start_component("cosmic-workspaces", span, &process_manager, &env_vars).await;
 
-	let span = info_span!(parent: None, "cosmic-osk");
-	start_component("cosmic-osk", span, &process_manager, &env_vars).await;
+		let span = info_span!(parent: None, "cosmic-osk");
+		start_component("cosmic-osk", span, &process_manager, &env_vars).await;
 
-	let span = info_span!(parent: None, "cosmic-bg");
-	start_component("cosmic-bg", span, &process_manager, &env_vars).await;
+		let span = info_span!(parent: None, "cosmic-osd");
+		start_component("cosmic-osd", span, &process_manager, &env_vars).await;
 
-	let span = info_span!(parent: None, "cosmic-greeter");
-	start_component("cosmic-greeter", span, &process_manager, &env_vars).await;
+		let span = info_span!(parent: None, "cosmic-bg");
+		start_component("cosmic-bg", span, &process_manager, &env_vars).await;
 
-	let span = info_span!(parent: None, "cosmic-files-applet");
-	start_component("cosmic-files-applet", span, &process_manager, &env_vars).await;
+		let span = info_span!(parent: None, "cosmic-greeter");
+		start_component("cosmic-greeter", span, &process_manager, &env_vars).await;
 
-	let span = info_span!(parent: None, "cosmic-idle");
-	start_component("cosmic-idle", span, &process_manager, &env_vars).await;
+		let span = info_span!(parent: None, "cosmic-files-applet");
+		start_component("cosmic-files-applet", span, &process_manager, &env_vars).await;
+
+		let span = info_span!(parent: None, "cosmic-idle");
+		start_component("cosmic-idle", span, &process_manager, &env_vars).await;
+	}
 
 	#[cfg(feature = "autostart")]
 	if !*is_systemd_used() {
 		info!("looking for autostart folders");
 		let mut directories_to_scan = Vec::new();
 
-		// we start by taking user specific directories, so that we can deduplicate and
-		// ensure user overrides are respected
+		// we start by taking user specific directories, so that we can
+		// deduplicate and ensure user overrides are respected
 
 		// user specific directories
 		if let Some(user_config_dir) = dirs::config_dir() {
@@ -411,7 +449,8 @@ async fn start(
 				let mut exec_words = exec_raw.split(" ");
 
 				if let Some(program_name) = exec_words.next() {
-					// filter out any placeholder args, since we might not be able to deal with them
+					// filter out any placeholder args, since we might not be
+					// able to deal with them
 					let filtered_args = exec_words
 						.filter(|s| !s.starts_with("%"))
 						.collect::<Vec<_>>();

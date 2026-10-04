@@ -1,0 +1,30 @@
+name: Continuous Integration
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  formatting:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo +nightly fmt --all -- --check
+
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libdbus-1-dev \
+            libinput-dev libpulse-dev libpipewire-0.3-dev libegl1-mesa-dev \
+            libudev-dev libgbm-dev libseat-dev libdisplay-info-dev
+      - name: Check
+        run: cargo +stable check
