@@ -4,6 +4,7 @@ extern crate tracing;
 
 mod a11y;
 mod comp;
+mod input_method;
 mod notifications;
 mod process;
 mod service;
@@ -262,6 +263,10 @@ async fn start(
 
 	// start a11y if configured
 	tokio::spawn(a11y::start_a11y(env_vars.clone(), process_manager.clone()));
+
+	// Launch native input methods from cosmic-comp's keyboard map via
+	// wp_security_context (app_id-gated input-method access).
+	input_method::start(env_vars.clone(), process_manager.clone());
 
 	let (panel_notifications_fd, daemon_notifications_fd) =
 		notifications::create_socket().expect("Failed to create notification socket");
