@@ -308,10 +308,7 @@ async fn start_inner(
 
 	let mut launched = HashSet::new();
 	for entry in map.into_values() {
-		if entry.app_id.is_empty()
-			|| entry.command.is_empty()
-			|| !launched.insert(entry.app_id.clone())
-		{
+		if !launched.insert(entry.app_id.clone()) {
 			continue;
 		}
 
